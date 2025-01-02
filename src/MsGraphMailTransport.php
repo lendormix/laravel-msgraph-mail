@@ -76,11 +76,14 @@ class MsGraphMailTransport extends Transport {
         } catch (BadResponseException $e) {
             // The API responded with 4XX or 5XX error
             if ($e->hasResponse()) $response = json_decode((string)$e->getResponse()->getBody());
+            echo "TEST1: ".$e->getMessage() . ' - ' . $e->getTraceAsString();
             throw CouldNotSendMail::serviceRespondedWithError($response->error->code ?? 'Unknown', $response->error->message ?? 'Unknown error');
         } catch (ConnectException $e) {
             // A connection error (DNS, timeout, ...) occurred
+            echo "TEST2: ".$e->getMessage() . ' - ' . $e->getTraceAsString();
             throw CouldNotReachService::networkError();
         } catch (Throwable $e) {
+            echo "TEST3: ".$e->getMessage() . ' - ' . $e->getTraceAsString();
             throw CouldNotReachService::unknownError();
         }
     }
