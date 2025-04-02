@@ -10,7 +10,7 @@ _Tested with different company (Microsoft 365 Business) accounts_
 Install the package using composer:
 
 ```
-composer require wapacro/laravel-msgraph-mail
+composer require lendormix/laravel-msgraph-mail
 ```
 
 Add the configuration to your mail.php config file:
