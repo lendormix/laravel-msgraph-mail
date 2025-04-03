@@ -1,24 +1,22 @@
 <?php
 
-
 namespace LaravelMsGraphMail;
 
 use GuzzleHttp\Client;
 use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Exception\BadResponseException;
 use GuzzleHttp\Exception\ConnectException;
-use Illuminate\Mail\Transport\Transport;
+use Symfony\Component\Mailer\Transport\AbstractTransport;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Str;
 use LaravelMsGraphMail\Exceptions\CouldNotGetToken;
 use LaravelMsGraphMail\Exceptions\CouldNotReachService;
 use LaravelMsGraphMail\Exceptions\CouldNotSendMail;
-use Swift_Mime_Attachment;
-use Swift_Mime_EmbeddedFile;
-use Swift_Mime_SimpleMessage;
+use Symfony\Component\Mime\Email;
+use Symfony\Component\Mime\Part\DataPart;
+use Symfony\Component\Mailer\SentMessage;
 use Throwable;
 
-class MsGraphMailTransport extends Transport {
+class MsGraphMailTransport extends AbstractTransport {
 
     /**
      * @var string
@@ -46,21 +44,30 @@ class MsGraphMailTransport extends Transport {
      * @param ClientInterface|null $client
      */
     public function __construct(array $config, ClientInterface $client = null) {
+        parent::__construct();
+        
         $this->config = $config;
         $this->http = $client ?? new Client();
     }
 
+    public function __toString(): string {
+        return 'msgraph';
+    }
+
     /**
      * Send given email message
-     * @param Swift_Mime_SimpleMessage $message
-     * @param null $failedRecipients
-     * @return int
+     * @param SentMessage $message
+     * @return void
      * @throws CouldNotSendMail
      * @throws CouldNotReachService
      */
-    public function send(Swift_Mime_SimpleMessage $message, &$failedRecipients = null): int {
-        $this->beforeSendPerformed($message);
-        $payload = $this->getPayload($message);
+    protected function doSend(SentMessage $message): void {
+        $email = $message->getOriginalMessage();
+        if (!$email instanceof Email) {
+            throw new \InvalidArgumentException('Expected instance of ' . Email::class);
+        }
+
+        $payload = $this->getPayload($email);
         $url = str_replace('{from}', urlencode($payload['from']['emailAddress']['address']), $this->apiEndpoint);
 
         try {
@@ -70,117 +77,128 @@ class MsGraphMailTransport extends Transport {
                     'message' => $payload,
                 ],
             ]);
-
-            $this->sendPerformed($message);
-            return $this->numberOfRecipients($message);
         } catch (BadResponseException $e) {
-            // The API responded with 4XX or 5XX error
             if ($e->hasResponse()) $response = json_decode((string)$e->getResponse()->getBody());
-            echo "TEST1: ".$e->getMessage() . ' - ' . $e->getTraceAsString();
             throw CouldNotSendMail::serviceRespondedWithError($response->error->code ?? 'Unknown', $response->error->message ?? 'Unknown error');
         } catch (ConnectException $e) {
-            // A connection error (DNS, timeout, ...) occurred
-            echo "TEST2: ".$e->getMessage() . ' - ' . $e->getTraceAsString();
             throw CouldNotReachService::networkError();
         } catch (Throwable $e) {
-            echo "TEST3: ".$e->getMessage() . ' - ' . $e->getTraceAsString();
             throw CouldNotReachService::unknownError();
         }
     }
 
     /**
-     * Transforms given SwiftMailer message instance into
+     * Transforms given Symfony Mailer message instance into
      * Microsoft Graph message object
-     * @param Swift_Mime_SimpleMessage $message
+     * @param Email $message
      * @return array
      */
-    protected function getPayload(Swift_Mime_SimpleMessage $message): array {
+    protected function getPayload(Email $message): array {
         $from = $message->getFrom();
-        $priority = $message->getPriority();
-        $attachments = $message->getChildren();
+        $fromEmail = $from[0]->getAddress();
+        $fromName = $from[0]->getName();
 
         return array_filter([
             'subject' => $message->getSubject(),
-            'sender' => $this->toRecipientCollection($from)[0],
-            'from' => $this->toRecipientCollection($from)[0],               
+            'sender' => [
+                'emailAddress' => [
+                    'name' => $fromName,
+                    'address' => $fromEmail,
+                ]
+            ],
+            'from' => [
+                'emailAddress' => [
+                    'name' => $fromName,
+                    'address' => $fromEmail,
+                ]
+            ],
             'replyTo' => $this->toRecipientCollection($message->getReplyTo()),
             'toRecipients' => $this->toRecipientCollection($message->getTo()),
             'ccRecipients' => $this->toRecipientCollection($message->getCc()),
             'bccRecipients' => $this->toRecipientCollection($message->getBcc()),
-            'importance' => $priority === 3 ? 'Normal' : ($priority < 3 ? 'Low' : 'High'),                
+            'importance' => 'Normal',
             'body' => [
-                'contentType' => Str::contains($message->getContentType(), ['plain']) ? 'text' : 'html',
-                'content' => $message->getBody(),
+                'contentType' => $message->getHtmlBody() ? 'html' : 'text',
+                'content' => $message->getHtmlBody() ?? $message->getTextBody(),
             ],
-            'attachments' => $this->toAttachmentCollection($attachments),
-            'singleValueExtendedProperties' => [['id' => 'String 0x1046', 'value' => $message->getReturnPath()]],                
+            'attachments' => $this->toAttachmentCollection($message->getAttachments()),
         ]);
     }
 
     /**
      * Transforms given SimpleMessage recipients into
      * Microsoft Graph recipients collection
-     * @param array|string $recipients
+     * @param array|string $addresses
      * @return array
      */
-    protected function toRecipientCollection($recipients): array {
+    protected function toRecipientCollection($addresses): array {
+        if (empty($addresses)) {
+            return [];
+        }
+
         $collection = [];
+        foreach ($addresses as $address) {
+            if (is_string($address)) {
+                $collection[] = [
+                    'emailAddress' => [
+                        'address' => $address,
+                    ],
+                ];
+                continue;
+            }
 
-        // If the provided list is empty
-        // return an empty collection
-        if (!$recipients) {
-            return $collection;
-        }
+            $name = null;
+            $email = null;
 
-        // Some fields yield single e-mail
-        // addresses instead of arrays
-        if (is_string($recipients)) {
-            $collection[] = [
-                'emailAddress' => [
-                    'name' => null,
-                    'address' => $recipients,
-                ],
-            ];
+            if (method_exists($address, 'getAddress')) {
+                $email = $address->getAddress();
+                $name = $address->getName();
+            } else if (is_array($address)) {
+                $email = key($address);
+                $name = current($address);
+            }
 
-            return $collection;
-        }
+            if ($email) {
+                $recipient = [
+                    'emailAddress' => [
+                        'address' => $email,
+                    ],
+                ];
 
-        foreach ($recipients as $address => $name) {
-            $collection[] = [
-                'emailAddress' => [
-                    'name' => $name,
-                    'address' => $address,
-                ],
-            ];
+                if ($name) {
+                    $recipient['emailAddress']['name'] = $name;
+                }
+
+                $collection[] = $recipient;
+            }
         }
 
         return $collection;
     }
 
     /**
-     * Transforms given SwiftMailer children into
+     * Transforms given Symfony Mailer attachments into
      * Microsoft Graph attachment collection
-     * @param $attachments
+     * @param array $attachments
      * @return array
      */
-    protected function toAttachmentCollection($attachments): array {
+    protected function toAttachmentCollection(array $attachments): array {
         $collection = [];
 
         foreach ($attachments as $attachment) {
-            if (!$attachment instanceof Swift_Mime_Attachment) {
+            if (!$attachment instanceof DataPart) {
                 continue;
             }
 
             $collection[] = [
                 'name' => $attachment->getFilename(),
-                'contentId' => $attachment->getId(),
+                'contentId' => $attachment->getContentId(),
                 'contentType' => $attachment->getContentType(),
                 'contentBytes' => base64_encode($attachment->getBody()),
                 'size' => strlen($attachment->getBody()),
                 '@odata.type' => '#microsoft.graph.fileAttachment',
-                'isInline' => $attachment instanceof Swift_Mime_EmbeddedFile,
+                'isInline' => $attachment->getDisposition() === 'inline',
             ];
-
         }
 
         return $collection;
